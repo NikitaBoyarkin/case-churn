@@ -1,0 +1,401 @@
+"""Volta Neobank — Churn Prediction.
+
+Builds and compares churn-prediction models on synthetic fintech user data:
+a Logistic Regression baseline vs a Random Forest. Demonstrates the full ML
+workflow — data prep, class balance, train/test split, model comparison by
+ROC-AUC, and feature-importance interpretation — then ties the drivers back
+to the segmentation narrative from Project 4. Finally, an out-of-time (OOT)
+validation re-fits the Random Forest on an early sign-up cohort and scores a
+later one, showing why the random-split AUC is an optimistic estimate.
+
+Run:  uv run python volta_churn_prediction.py
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
+)
+from sklearn.model_selection import train_test_split
+
+from utils.common import (
+    OUTPUT_DIR,
+    data_path,
+    print_section,
+    print_subsection,
+    setup,
+)
+
+SEED = 42
+TARGET = "churned"
+CAT_FEATURES = ["channel"]
+TIME_FEATURE = "signup_month"
+OOT_TEST_FRACTION = 0.30
+
+
+def load_data() -> pd.DataFrame:
+    return pd.read_csv(data_path("volta_churn_data.csv"))
+
+
+def prep_features(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Return feature matrix, target vector, and feature-name list."""
+    features = df.drop(columns=[TARGET, "customer_id"])
+    features = pd.get_dummies(features, columns=CAT_FEATURES, drop_first=True)
+    feature_names = list(features.columns)
+    return features.to_numpy(dtype=float), df[TARGET].to_numpy(dtype=float), feature_names
+
+
+def fit_models(X: np.ndarray, y: np.ndarray) -> dict[str, Any]:
+    """Train a Logistic Regression and a Random Forest; return fitted models."""
+    lr = LogisticRegression(max_iter=1000, random_state=SEED)
+    rf = RandomForestClassifier(n_estimators=200, random_state=SEED, n_jobs=-1)
+    lr.fit(X, y)
+    rf.fit(X, y)
+    return {"Logistic Regression": lr, "Random Forest": rf}
+
+
+def evaluate(models: dict[str, Any], X_test: np.ndarray, y_test: np.ndarray) -> pd.DataFrame:
+    """Compute standard classification metrics per model."""
+    rows: list[dict[str, Any]] = []
+    for name, model in models.items():
+        pred = model.predict(X_test)
+        prob = model.predict_proba(X_test)[:, 1]
+        rows.append(
+            {
+                "Model": name,
+                "ROC-AUC": roc_auc_score(y_test, prob),
+                "Accuracy": accuracy_score(y_test, pred),
+                "Precision": precision_score(y_test, pred),
+                "Recall": recall_score(y_test, pred),
+                "F1": f1_score(y_test, pred),
+            }
+        )
+    return pd.DataFrame(rows).set_index("Model")
+
+
+def plot_roc(
+    models: dict[str, Any],
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    out: Path,
+) -> Path:
+    import matplotlib.pyplot as plt
+
+    plt.figure(figsize=(7, 5))
+    for name, model in models.items():
+        prob = model.predict_proba(X_test)[:, 1]
+        fpr, tpr, _ = roc_curve(y_test, prob)
+        auc = roc_auc_score(y_test, prob)
+        plt.plot(fpr, tpr, label=f"{name} (AUC={auc:.3f})")
+    plt.plot([0, 1], [0, 1], "k--", alpha=0.4)
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("Churn Model ROC Curves")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out, dpi=120)
+    plt.close()
+    return out
+
+
+def feature_importance(rf: Any, feature_names: list[str], top_n: int = 5) -> pd.DataFrame:
+    """Top-N feature importances from the Random Forest, as a DataFrame."""
+    imp = rf.feature_importances_
+    df = pd.DataFrame({"Feature": feature_names, "Importance": imp})
+    df = df.sort_values("Importance", ascending=False).head(top_n).reset_index(drop=True)
+    return df
+
+
+def plot_importance(imp_df: pd.DataFrame, out: Path) -> Path:
+    import matplotlib.pyplot as plt
+
+    plt.figure(figsize=(7, 5))
+    plt.barh(imp_df["Feature"], imp_df["Importance"], color="#4c72b0")
+    plt.gca().invert_yaxis()
+    plt.xlabel("Feature Importance (RF)")
+    plt.title("Top Churn Drivers")
+    plt.tight_layout()
+    plt.savefig(out, dpi=120)
+    plt.close()
+    return out
+
+
+def section_setup(df: pd.DataFrame) -> None:
+    print_section("VOLTA NEOBANK — CHURN PREDICTION")
+    churn_rate = df[TARGET].mean()
+    print_subsection("Data & Class Balance")
+    print(f"  Shape: {df.shape[0]:,} users × {df.shape[1]} features")
+    print(f"  Class balance: churned={churn_rate:.1%}, retained={1 - churn_rate:.1%}")
+    print("  (No resampling — the imbalance is modest and we optimise ROC-AUC.)")
+
+
+def section_models(
+    models: dict[str, Any], metrics: pd.DataFrame, X_test: np.ndarray, y_test: np.ndarray
+) -> None:
+    print_subsection("Model Comparison")
+    print(metrics.to_string())
+    best = metrics["ROC-AUC"].idxmax()
+    gap = metrics.loc["Random Forest", "ROC-AUC"] - metrics.loc["Logistic Regression", "ROC-AUC"]
+    print(f"\n  Best by ROC-AUC: {best}")
+    print(f"  RF − LR gap: {gap:+.3f} AUC")
+    if gap >= 0.02:
+        print("  → Gap ≥ 0.02: non-linear model adds value; keep Random Forest.")
+    else:
+        print("  → Gap < 0.02: linear baseline suffices; prefer the simpler model.")
+
+
+def section_roc(models: dict[str, Any], X_test: np.ndarray, y_test: np.ndarray) -> Path:
+    print_subsection("ROC Curves")
+    out = plot_roc(models, X_test, y_test, OUTPUT_DIR / "churn_roc_curve.png")
+    print(f"  Saved: {out.name}")
+    return out
+
+
+def section_feature_importance(imp_df: pd.DataFrame) -> Path:
+    print_subsection("Top Churn Drivers (Feature Importance)")
+    print(imp_df.to_string(index=False))
+    out = plot_importance(imp_df, OUTPUT_DIR / "churn_feature_importance.png")
+    print(f"  Saved: {out.name}")
+    return out
+
+
+# ── Out-of-time (OOT) validation ─────────────────────────────────────────────
+def out_of_time_split(
+    df: pd.DataFrame, test_fraction: float = OOT_TEST_FRACTION
+) -> tuple[pd.DataFrame, pd.DataFrame, int]:
+    """Split users by sign-up month: early cohort trains, latest ~30% is held out.
+
+    Unlike a random split, no train user shares the observation window with a
+    test user, so this is the honest estimate of how the model scores users
+    it could not have seen at training time.
+    """
+    cutoff = int(np.quantile(df[TIME_FEATURE], 1 - test_fraction))
+    train = df[df[TIME_FEATURE] < cutoff].reset_index(drop=True)
+    test = df[df[TIME_FEATURE] >= cutoff].reset_index(drop=True)
+    if train.empty or test.empty:
+        raise ValueError(
+            f"Degenerate time split at cutoff month {cutoff}: train={len(train)}, test={len(test)}"
+        )
+    return train, test, cutoff
+
+
+def section_out_of_time(df: pd.DataFrame, random_split_auc: float) -> dict[str, Any]:
+    """Re-fit the RF on an early sign-up cohort and score a later one (OOT).
+
+    The random-split AUC mixes users observed over the same window into train
+    and test, which is optimistic — `days_since_last_activity` is measured in
+    that shared window and is already close to the churn definition itself.
+    The OOT number below is the one to quote.
+    """
+    print_subsection("Out-of-Time Validation (train on early cohort, test on late)")
+    train_df, test_df, cutoff = out_of_time_split(df)
+    months = df[TIME_FEATURE].to_numpy()
+
+    # Preprocess once, then split by the same time mask -> identical features.
+    X, y, _ = prep_features(df)
+    train_mask = months < cutoff
+    X_train, y_train = X[train_mask], y[train_mask]
+    X_test, y_test = X[~train_mask], y[~train_mask]
+
+    rf = RandomForestClassifier(n_estimators=200, random_state=SEED, n_jobs=-1)
+    rf.fit(X_train, y_train)
+    oot_auc = float(roc_auc_score(y_test, rf.predict_proba(X_test)[:, 1]))
+
+    train_months = train_df[TIME_FEATURE].agg(["min", "max"])
+    test_months = test_df[TIME_FEATURE].agg(["min", "max"])
+    result: dict[str, Any] = {
+        "random_split_auc": float(random_split_auc),
+        "oot_auc": oot_auc,
+        "cutoff_month": cutoff,
+        "train_months": (int(train_months["min"]), int(train_months["max"])),
+        "test_months": (int(test_months["min"]), int(test_months["max"])),
+        "n_train": len(train_df),
+        "n_test": len(test_df),
+        "train_churn_rate": float(train_df[TARGET].mean()),
+        "test_churn_rate": float(test_df[TARGET].mean()),
+    }
+
+    print(
+        f"  Train: months {result['train_months'][0]}–{result['train_months'][1]} "
+        f"({result['n_train']:,} users, churn {result['train_churn_rate']:.1%})"
+    )
+    print(
+        f"  Test:  months {result['test_months'][0]}–{result['test_months'][1]} "
+        f"({result['n_test']:,} users, churn {result['test_churn_rate']:.1%})"
+    )
+    gap = result["oot_auc"] - result["random_split_auc"]
+    print(f"  Random-split AUC: {result['random_split_auc']:.3f}")
+    print(f"  OOT AUC:          {result['oot_auc']:.3f}  (gap {gap:+.3f})")
+    if gap < 0:
+        print("  → OOT AUC below random-split — expected: a random split is optimistic")
+    else:
+        print("  → OOT gap within noise here (the synthetic process is stationary),")
+        print("    but under real cohort drift this is where the drop shows up first.")
+    print("  Caveats, honestly stated:")
+    print("    * days_since_last_activity is nearly tautological with the churn")
+    print("      label (churn IS sustained inactivity), so both AUCs are inflated;")
+    print("      the honest production fix is to score it as of a data cut-off")
+    print("      before the churn outcome is knowable.")
+    print("    * The time split is the number to quote in interviews: it tests")
+    print("      whether relationships hold for users observed later, not just")
+    print("      random re-samples of the same window.")
+    return result
+
+
+# ── SHAP explainability (REQ-202, Portfolio 2.0) ─────────────────────────────
+SHAP_SAMPLE = 500
+
+
+def shap_positive_class(rf: Any, X_sample: np.ndarray) -> tuple[np.ndarray, float, Any]:
+    """SHAP values for the churn (positive) class + the base value + explainer.
+
+    `shap_values` returns shape (n, features, n_classes) for a binary RF in
+    current shap; we slice the positive class so downstream plots are 2-D.
+    """
+    import shap
+
+    explainer = shap.TreeExplainer(rf)
+    values = np.asarray(explainer.shap_values(X_sample))
+    if values.ndim == 3:
+        values = values[:, :, 1]
+    base = float(np.ravel(explainer.expected_value)[-1])
+    return values, base, explainer
+
+
+def plot_shap_summary(
+    shap_values: np.ndarray, X_sample: np.ndarray, feature_names: list[str], out: Path
+) -> Path:
+    """Global SHAP beeswarm summary: distribution of impact per feature."""
+    import matplotlib.pyplot as plt
+    import shap
+
+    shap.summary_plot(shap_values, X_sample, feature_names=feature_names, show=False)
+    fig = plt.gcf()
+    fig.set_size_inches(9, 6)
+    fig.savefig(out, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return out
+
+
+def plot_shap_local(
+    shap_values: np.ndarray,
+    X_sample: np.ndarray,
+    base_value: float,
+    feature_names: list[str],
+    idx: int,
+    out: Path,
+) -> Path:
+    """Local SHAP waterfall for one user: why *this* user is high/low risk."""
+    import matplotlib.pyplot as plt
+    import shap
+
+    explanation = shap.Explanation(
+        values=shap_values[idx],
+        base_values=base_value,
+        data=X_sample[idx],
+        feature_names=feature_names,
+    )
+    shap.plots.waterfall(explanation, show=False)
+    fig = plt.gcf()
+    fig.set_size_inches(9, 6)
+    fig.savefig(out, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return out
+
+
+def section_shap(rf: Any, X_sample: np.ndarray, feature_names: list[str]) -> None:
+    print_subsection("SHAP Explainability (REQ-202)")
+    shap_values, base, _ = shap_positive_class(rf, X_sample)
+    mean_abs = (
+        pd.DataFrame({"Feature": feature_names, "mean_abs_SHAP": np.abs(shap_values).mean(axis=0)})
+        .sort_values("mean_abs_SHAP", ascending=False)
+        .reset_index(drop=True)
+    )
+    print("  Global drivers (mean |SHAP|, churn class):")
+    print(mean_abs.head(6).to_string(index=False))
+    print(f"  Base value (expected churn probability): {base:.3f}")
+
+    summary_out = plot_shap_summary(
+        shap_values, X_sample, feature_names, OUTPUT_DIR / "churn_shap_summary.png"
+    )
+    print(f"  Saved: {summary_out.name}  (beeswarm — global impact & direction)")
+
+    probs = rf.predict_proba(X_sample)[:, 1]
+    idx = int(np.argmax(probs))
+    local_out = plot_shap_local(
+        shap_values,
+        X_sample,
+        base,
+        feature_names,
+        idx,
+        OUTPUT_DIR / "churn_shap_local.png",
+    )
+    print(f"  Highest-risk user in sample: p(churn) = {probs[idx]:.2f}")
+    print(f"  Saved: {local_out.name}  (waterfall — why THIS user)")
+    print("  → SHAP confirms feature importance but adds direction per user,")
+    print("    which is what makes a churn score actionable (and auditable).")
+
+
+def section_insights(imp_df: pd.DataFrame) -> None:
+    print_subsection("Insights → Segmentation Link")
+    top = imp_df["Feature"].iloc[0]
+    print(f"  #1 driver: {top}")
+    print("  Interpretation:")
+    print("    1. Inactivity and device errors dominate churn — a UX/reliability problem,")
+    print("       not just a pricing one.")
+    print("    2. Premium users churn less (retention-safe lever for monetization).")
+    print("    3. Connect to Project 4: the Dormant segment overlaps the high-churn tail —")
+    print("       target them with re-engagement before they churn.")
+
+
+def section_recommendations() -> None:
+    print_subsection("Recommendations")
+    print("  1. Deploy RF churn scores to tag high-risk users for save-offers.")
+    print("  2. Fix device-error rate (top driver) — reliability sprint, not marketing.")
+    print("  3. Trigger re-engagement for inactivity > 30 days (Dormant segment).")
+
+
+def main() -> None:
+    setup()
+    df = load_data()
+
+    section_setup(df)
+    X, y, feature_names = prep_features(df)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=SEED, stratify=y
+    )
+    models = fit_models(X_train, y_train)
+    metrics = evaluate(models, X_test, y_test)
+    section_models(models, metrics, X_test, y_test)
+    section_roc(models, X_test, y_test)
+    imp_df = feature_importance(models["Random Forest"], feature_names)
+    section_feature_importance(imp_df)
+
+    section_out_of_time(df, random_split_auc=float(metrics.loc["Random Forest", "ROC-AUC"]))
+
+    rng = np.random.default_rng(SEED)
+    sample_idx = rng.choice(len(X_test), size=min(SHAP_SAMPLE, len(X_test)), replace=False)
+    section_shap(models["Random Forest"], X_test[sample_idx], feature_names)
+
+    section_insights(imp_df)
+    section_recommendations()
+
+    print("\n" + "=" * 60)
+    print("Analysis complete. Review recommendations above.")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()

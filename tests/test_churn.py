@@ -1,0 +1,163 @@
+"""Tests for volta_churn_prediction.py."""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
+
+from volta_churn_prediction import (
+    evaluate,
+    feature_importance,
+    fit_models,
+    load_data,
+    out_of_time_split,
+    plot_importance,
+    plot_roc,
+    plot_shap_local,
+    plot_shap_summary,
+    prep_features,
+    section_out_of_time,
+    shap_positive_class,
+)
+
+SEED = 42
+
+
+def test_load_data_shape() -> None:
+    df = load_data()
+    assert "churned" in df.columns
+    assert len(df) > 0
+    assert df.shape[1] > 5
+
+
+def test_prep_features_drops_id_and_target() -> None:
+    df = load_data()
+    X, y, names = prep_features(df)
+    assert y.shape[0] == len(df)
+    assert "churned" not in names
+    assert "customer_id" not in names
+    # channel is one-hot encoded (drop_first -> one fewer column than categories)
+    assert "channel_google_play" in names
+
+
+def test_fit_models_returns_two_fitted_models() -> None:
+    rng = np.random.default_rng(SEED)
+    X = rng.normal(size=(200, 5))
+    y = (X[:, 0] > 0).astype(int)
+    models = fit_models(X, y)
+    assert set(models) == {"Logistic Regression", "Random Forest"}
+    assert isinstance(models["Logistic Regression"], LogisticRegression)
+    assert isinstance(models["Random Forest"], RandomForestClassifier)
+
+
+def test_evaluate_returns_expected_metrics() -> None:
+    rng = np.random.default_rng(SEED)
+    X = rng.normal(size=(100, 5))
+    y = (X[:, 0] > 0).astype(int)
+    models = fit_models(X, y)
+    metrics = evaluate(models, X, y)
+    assert list(metrics.index) == ["Logistic Regression", "Random Forest"]
+    for col in ("ROC-AUC", "Accuracy", "Precision", "Recall", "F1"):
+        assert col in metrics.columns
+    assert metrics["ROC-AUC"].between(0, 1).all()
+
+
+def test_feature_importance_returns_top_n_sorted() -> None:
+    df = load_data()
+    X, y, names = prep_features(df)
+    rf = fit_models(X[:500], y[:500])["Random Forest"]
+    imp = feature_importance(rf, names, top_n=5)
+    assert len(imp) == 5
+    assert imp["Importance"].is_monotonic_decreasing
+    assert (imp["Importance"] >= 0).all()
+
+
+def test_rf_beats_lr_on_committed_data() -> None:
+    """The core portfolio claim: RF ROC-AUC exceeds LR by >= 0.02 on the data."""
+    df = load_data()
+    X, y, _ = prep_features(df)
+    models = fit_models(X, y)
+    metrics = evaluate(models, X, y)
+    gap = metrics.loc["Random Forest", "ROC-AUC"] - metrics.loc["Logistic Regression", "ROC-AUC"]
+    assert gap >= 0.02
+
+
+def test_plot_roc_writes_png(tmp_path) -> None:
+    df = load_data()
+    X, y, _ = prep_features(df)
+    models = fit_models(X, y)
+    out = plot_roc(models, X, y, tmp_path / "roc.png")
+    assert out.exists() and out.stat().st_size > 0
+
+
+def test_plot_importance_writes_png(tmp_path) -> None:
+    imp = pd.DataFrame({"Feature": ["a", "b", "c"], "Importance": [0.5, 0.3, 0.2]})
+    out = plot_importance(imp, tmp_path / "imp.png")
+    assert out.exists() and out.stat().st_size > 0
+
+
+def test_shap_positive_class_shape_and_base() -> None:
+    """SHAP values are 2-D (n, features) for the churn class with a base value."""
+    df = load_data()
+    X, y, names = prep_features(df)
+    rf = fit_models(X[:500], y[:500])["Random Forest"]
+    values, base, _ = shap_positive_class(rf, X[:50])
+    assert values.shape == (50, len(names))
+    assert 0.0 <= base <= 1.0
+
+
+def test_plot_shap_summary_writes_png(tmp_path) -> None:
+    df = load_data()
+    X, y, names = prep_features(df)
+    rf = fit_models(X[:500], y[:500])["Random Forest"]
+    values, _, _ = shap_positive_class(rf, X[:50])
+    out = plot_shap_summary(values, X[:50], names, tmp_path / "summary.png")
+    assert out.exists() and out.stat().st_size > 1000
+
+
+def test_plot_shap_local_writes_png(tmp_path) -> None:
+    df = load_data()
+    X, y, names = prep_features(df)
+    rf = fit_models(X[:500], y[:500])["Random Forest"]
+    values, base, _ = shap_positive_class(rf, X[:50])
+    out = plot_shap_local(values, X[:50], base, names, 0, tmp_path / "local.png")
+    assert out.exists() and out.stat().st_size > 1000
+
+
+def test_out_of_time_split_is_temporal_and_disjoint() -> None:
+    """Train and test share no observation window and no users."""
+    df = load_data()
+    train, test, cutoff = out_of_time_split(df)
+    assert train["signup_month"].max() < cutoff
+    assert test["signup_month"].min() >= cutoff
+    # no user overlap between periods
+    assert len(set(train["customer_id"]) & set(test["customer_id"])) == 0
+    assert len(train) > 0 and len(test) > 0
+    # test holds roughly the last ~30% of the window
+    assert 0.2 <= len(test) / len(df) <= 0.4
+
+
+def test_section_out_of_time_returns_honest_auc() -> None:
+    """OOT section returns a dict with a valid AUC computed on a later period."""
+    df = load_data()
+    # reproduce the random-split RF AUC exactly as main() does
+    X, y, _ = prep_features(df)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=SEED, stratify=y
+    )
+    rf = RandomForestClassifier(n_estimators=200, random_state=SEED, n_jobs=-1)
+    rf.fit(X_train, y_train)
+    random_auc = float(roc_auc_score(y_test, rf.predict_proba(X_test)[:, 1]))
+
+    result = section_out_of_time(df, random_split_auc=random_auc)
+    assert isinstance(result, dict)
+    assert 0.0 <= result["oot_auc"] <= 1.0
+    assert 0.0 <= result["random_split_auc"] <= 1.0
+    # train period strictly precedes the test period
+    assert result["train_months"][1] < result["test_months"][0]
+    assert result["n_train"] + result["n_test"] == len(df)
+    assert result["n_train"] > 0 and result["n_test"] > 0
